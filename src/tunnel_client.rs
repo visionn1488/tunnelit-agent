@@ -49,6 +49,18 @@ impl TunnelClient {
             }
         });
 
+        // Keep connection alive with periodic pings every 15s (prevents reverse proxy / Caddy idle timeouts)
+        let ping_tx = tx.clone();
+        let ping_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                if ping_tx.send(AgentMessage::Ping).is_err() {
+                    break;
+                }
+            }
+        });
+
         // Authenticate or request Claim
         if let Some(token) = &self.token {
             tx.send(AgentMessage::Auth {
@@ -65,7 +77,13 @@ impl TunnelClient {
             match msg_result {
                 Ok(Message::Text(text)) => {
                     match serde_json::from_str::<RelayMessage>(&text) {
-                        Ok(RelayMessage::ClaimReady { code, claim_url }) => {
+                        Ok(RelayMessage::ClaimReady { code, claim_url, token }) => {
+                            if let Some(ref t) = token {
+                                self.token = Some(t.clone());
+                                let mut cfg = AgentConfig::load();
+                                cfg.token = Some(t.clone());
+                                cfg.save();
+                            }
                             let web_host = self.relay_url.host_str().unwrap_or("localhost");
                             let display_host = if web_host.contains("ws.") {
                                 web_host.replace("ws.", "cabinet.")
@@ -176,6 +194,8 @@ impl TunnelClient {
             }
         }
 
+        ping_handle.abort();
         Ok(())
     }
 }
+

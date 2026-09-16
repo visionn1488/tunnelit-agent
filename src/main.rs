@@ -32,6 +32,12 @@ async fn main() {
     let args = Args::parse();
     let config = AgentConfig::load();
 
+    if let Some(ref tok) = args.token {
+        let mut cfg = config.clone();
+        cfg.token = Some(tok.clone());
+        cfg.save();
+    }
+
     let relay_str = args
         .relay
         .or(config.relay)
