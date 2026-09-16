@@ -67,8 +67,13 @@ impl TunnelClient {
                     match serde_json::from_str::<RelayMessage>(&text) {
                         Ok(RelayMessage::ClaimReady { code, claim_url }) => {
                             let web_host = self.relay_url.host_str().unwrap_or("localhost");
-                            // Replace ws. with admin. if present
-                            let display_host = web_host.replace("ws.", "admin.");
+                            let display_host = if web_host.contains("ws.") {
+                                web_host.replace("ws.", "cabinet.")
+                            } else if web_host.contains("ezbchat.fun") {
+                                "cabinet.ezbchat.fun".to_string()
+                            } else {
+                                web_host.to_string()
+                            };
                             let full_url = if claim_url.starts_with("http") {
                                 claim_url
                             } else {
