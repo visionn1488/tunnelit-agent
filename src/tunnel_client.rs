@@ -1,3 +1,4 @@
+use crate::config::AgentConfig;
 use crate::local_proxy::LocalConnections;
 use crate::protocol::{AgentMessage, RelayMessage};
 use base64::{engine::general_purpose::STANDARD as b64, Engine};
@@ -5,110 +6,159 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use url::Url;
 
 pub struct TunnelClient {
     relay_url: Url,
-    local_port: u16,
-    protocol: String,
-    preferred_port: Option<u16>,
-    subdomain: Option<String>,
+    token: Option<String>,
+    hostname: String,
 }
 
 impl TunnelClient {
-    pub fn new(
-        relay_url: Url,
-        local_port: u16,
-        protocol: String,
-        preferred_port: Option<u16>,
-        subdomain: Option<String>,
-    ) -> Self {
+    pub fn new(relay_url: Url, token: Option<String>) -> Self {
+        let hostname = std::env::var("USER")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "my-device".to_string());
+
         Self {
             relay_url,
-            local_port,
-            protocol,
-            preferred_port,
-            subdomain,
+            token,
+            hostname,
         }
     }
 
-    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Connecting to relay at {}", self.relay_url);
         let (ws_stream, _) = connect_async(self.relay_url.clone()).await?;
-        info!("Connected to relay");
+        info!("WebSocket connected to relay");
 
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
         let (tx, mut rx) = mpsc::unbounded_channel::<AgentMessage>();
 
-        let mut local_connections = LocalConnections::new();
-        
-        // Spawn task to forward messages from tx channel to websocket
+        let local_connections = LocalConnections::new();
+
+        // Forward internal messages to WebSocket
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                match serde_json::to_string(&msg) {
-                    Ok(json) => {
-                        if let Err(e) = ws_sender.send(Message::Text(json)).await {
-                            error!("Failed to send message to relay: {}", e);
-                            break;
-                        }
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    if ws_sender.send(Message::Text(json)).await.is_err() {
+                        break;
                     }
-                    Err(e) => error!("Failed to serialize message: {}", e),
                 }
             }
         });
 
-        // Send CreateTunnel
-        let create_tunnel = AgentMessage::CreateTunnel {
-            local_port: self.local_port,
-            protocol: self.protocol.clone(),
-            preferred_port: self.preferred_port,
-        };
-        tx.send(create_tunnel)?;
+        // Authenticate or request Claim
+        if let Some(token) = &self.token {
+            tx.send(AgentMessage::Auth {
+                token: token.clone(),
+                hostname: self.hostname.clone(),
+            })?;
+        } else {
+            tx.send(AgentMessage::RequestClaim {
+                hostname: self.hostname.clone(),
+            })?;
+        }
 
         while let Some(msg_result) = ws_receiver.next().await {
             match msg_result {
-                Ok(Message::Text(text)) => match serde_json::from_str::<RelayMessage>(&text) {
-                    Ok(RelayMessage::TunnelCreated { tunnel_id, public_port }) => {
-                        info!(
-                            "Tunnel created! public port: {}, id: {}",
-                            public_port, tunnel_id
-                        );
-                        if let Some(desired_name) = &self.subdomain {
-                            tx.send(AgentMessage::RequestSubdomain {
-                                tunnel_id,
-                                desired_name: desired_name.clone(),
-                            })?;
+                Ok(Message::Text(text)) => {
+                    match serde_json::from_str::<RelayMessage>(&text) {
+                        Ok(RelayMessage::ClaimReady { code, claim_url }) => {
+                            let web_host = self.relay_url.host_str().unwrap_or("localhost");
+                            // Replace ws. with admin. if present
+                            let display_host = web_host.replace("ws.", "admin.");
+                            let full_url = if claim_url.starts_with("http") {
+                                claim_url
+                            } else {
+                                format!("https://{}{}", display_host, claim_url)
+                            };
+
+                            println!("\n╔════════════════════════════════════════════════════════════════════════════╗");
+                            println!("║                                                                            ║");
+                            println!("║   🔗 LINK YOUR DEVICE TO YOUR ACCOUNT:                                     ║");
+                            println!("║                                                                            ║");
+                            println!("║      {}", full_url);
+                            println!("║                                                                            ║");
+                            println!("║   (Or visit your dashboard and enter code: {})                     ║", code);
+                            println!("║                                                                            ║");
+                            println!("╚════════════════════════════════════════════════════════════════════════════╝\n");
+                            println!("Waiting for confirmation in browser...");
                         }
-                    }
-                    Ok(RelayMessage::NewConnection { tunnel_id: _, conn_id }) => {
-                        info!("New connection: {}", conn_id);
-                        if self.protocol == "tcp" {
-                            local_connections.spawn_tcp_connection(conn_id, self.local_port, tx.clone());
-                        } else if self.protocol == "udp" {
-                            local_connections.spawn_udp_connection(conn_id, self.local_port, tx.clone());
+                        Ok(RelayMessage::AuthSuccess { name, token, .. }) => {
+                            self.token = Some(token.clone());
+                            let mut cfg = AgentConfig::load();
+                            cfg.token = Some(token);
+                            cfg.save();
+
+                            println!("\n==================================================");
+                            println!("  ✅ Connected and Authenticated as '{}'", name);
+                            println!("  🌐 Manage your tunnels in the web dashboard!");
+                            println!("==================================================\n");
                         }
-                    }
-                    Ok(RelayMessage::Data { conn_id, payload }) => {
-                        match b64.decode(payload) {
-                            Ok(data) => {
+                        Ok(RelayMessage::SyncTunnels { tunnels }) => {
+                            local_connections.sync_tunnels(tunnels.clone()).await;
+
+                            println!("--- Active Tunnels ({} configured) ---", tunnels.len());
+                            for t in &tunnels {
+                                if t.enabled {
+                                    println!(
+                                        "  🟢 [{}] {} -> 127.0.0.1:{} (Public Port: {})",
+                                        t.protocol.to_uppercase(),
+                                        t.name,
+                                        t.local_port,
+                                        t.public_port
+                                    );
+                                } else {
+                                    println!("  ⚪ [{}] {} (Paused)", t.protocol.to_uppercase(), t.name);
+                                }
+                            }
+                            println!("--------------------------------------");
+                        }
+                        Ok(RelayMessage::StartTunnel { tunnel }) => {
+                            println!(
+                                "\n[+] Tunnel Activated: {} [{}] 127.0.0.1:{} -> Public :{}",
+                                tunnel.name,
+                                tunnel.protocol.to_uppercase(),
+                                tunnel.local_port,
+                                tunnel.public_port
+                            );
+                            local_connections.start_tunnel(tunnel).await;
+                        }
+                        Ok(RelayMessage::StopTunnel { tunnel_id }) => {
+                            println!("\n[-] Tunnel Deactivated: {}", tunnel_id);
+                            local_connections.stop_tunnel(&tunnel_id).await;
+                        }
+                        Ok(RelayMessage::NewConnection { tunnel_id, conn_id }) => {
+                            local_connections
+                                .handle_new_connection(tunnel_id, conn_id, tx.clone())
+                                .await;
+                        }
+                        Ok(RelayMessage::Data { conn_id, payload }) => {
+                            if let Ok(data) = b64.decode(payload) {
                                 local_connections.route_data(conn_id, data).await;
                             }
-                            Err(e) => error!("Failed to decode payload for {}: {}", conn_id, e),
+                        }
+                        Ok(RelayMessage::CloseConnection { conn_id }) => {
+                            local_connections.close_connection(&conn_id).await;
+                        }
+                        Ok(RelayMessage::Error { message }) => {
+                            error!("Relay error: {}", message);
+                            if message.contains("Invalid") || message.contains("expired") {
+                                warn!("Clearing saved token due to authentication failure");
+                                let mut cfg = AgentConfig::load();
+                                cfg.token = None;
+                                cfg.save();
+                                self.token = None;
+                            }
+                        }
+                        Ok(RelayMessage::Pong) => {}
+                        Err(e) => {
+                            warn!("Failed to parse RelayMessage: {} | {}", e, text);
                         }
                     }
-                    Ok(RelayMessage::CloseConnection { conn_id }) => {
-                        info!("Relay requested to close connection: {}", conn_id);
-                        local_connections.close_connection(&conn_id);
-                    }
-                    Ok(RelayMessage::SubdomainAssigned { tunnel_id: _, subdomain }) => {
-                        info!("Subdomain assigned: {}", subdomain);
-                    }
-                    Ok(RelayMessage::Error { message }) => {
-                        error!("Relay error: {}", message);
-                    }
-                    Err(e) => error!("Failed to parse RelayMessage: {} | {}", e, text),
-                },
+                }
                 Ok(Message::Close(_)) => {
                     info!("Relay closed connection");
                     break;
@@ -117,7 +167,7 @@ impl TunnelClient {
                     error!("WebSocket error: {}", e);
                     break;
                 }
-                _ => {} // Ignore other message types (Ping, Pong, Binary)
+                _ => {}
             }
         }
 

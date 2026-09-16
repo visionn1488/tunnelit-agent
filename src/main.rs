@@ -1,30 +1,25 @@
+mod config;
 mod local_proxy;
 mod protocol;
 mod tunnel_client;
 
 use clap::Parser;
+use config::AgentConfig;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
 use url::Url;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = "tunnelit agent — manage all your tunnels from the web dashboard", long_about = None)]
 struct Args {
+    /// Relay WebSocket URL (e.g. wss://ws.ezbchat.fun/ws or ws://127.0.0.1:9090/ws)
     #[arg(short, long)]
-    relay: String,
+    relay: Option<String>,
 
+    /// Secret agent token (optional, if not provided will generate a web claim link)
     #[arg(short, long)]
-    local: u16,
-
-    #[arg(short, long)]
-    proto: String,
-
-    #[arg(long)]
-    remote_port: Option<u16>,
-
-    #[arg(long)]
-    subdomain: Option<String>,
+    token: Option<String>,
 }
 
 #[tokio::main]
@@ -32,15 +27,22 @@ async fn main() {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    let _ = tracing::subscriber::set_global_default(subscriber);
 
     let args = Args::parse();
-    
-    let relay_url = match Url::parse(&args.relay) {
+    let config = AgentConfig::load();
+
+    let relay_str = args
+        .relay
+        .or(config.relay)
+        .unwrap_or_else(|| "wss://ws.ezbchat.fun/ws".to_string());
+
+    let token = args.token.or(config.token);
+
+    let relay_url = match Url::parse(&relay_str) {
         Ok(url) => url,
         Err(e) => {
-            error!("Invalid relay URL: {}", e);
+            error!("Invalid relay URL '{}': {}", relay_str, e);
             std::process::exit(1);
         }
     };
@@ -49,28 +51,31 @@ async fn main() {
     println!("          tunnelit-agent                ");
     println!("========================================");
     println!("Relay: {}", relay_url);
-    println!("Local Port: {}", args.local);
-    println!("Protocol: {}", args.proto);
-    if let Some(rp) = args.remote_port {
-        println!("Requested Remote Port: {}", rp);
-    }
-    if let Some(sd) = &args.subdomain {
-        println!("Requested Subdomain: {}", sd);
+    println!("Config file: {:?}", AgentConfig::config_path());
+    if token.is_some() {
+        println!("Auth: Token found");
+    } else {
+        println!("Auth: No token (web claim link will be requested)");
     }
     println!("========================================");
 
+    let mut current_token = token;
+
     loop {
-        let client = tunnel_client::TunnelClient::new(
+        let mut client = tunnel_client::TunnelClient::new(
             relay_url.clone(),
-            args.local,
-            args.proto.clone(),
-            args.remote_port,
-            args.subdomain.clone(),
+            current_token.clone(),
         );
 
-        info!("Starting client...");
+        info!("Starting client connection...");
         if let Err(e) = client.run().await {
-            error!("Client error: {}", e);
+            error!("Connection error: {}", e);
+        }
+
+        // Check if client obtained a token during claim
+        let updated_cfg = AgentConfig::load();
+        if updated_cfg.token.is_some() {
+            current_token = updated_cfg.token;
         }
 
         info!("Disconnected. Reconnecting in 3 seconds...");
