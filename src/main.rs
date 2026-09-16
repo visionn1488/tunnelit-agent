@@ -32,7 +32,13 @@ async fn main() {
     let args = Args::parse();
     let config = AgentConfig::load();
 
-    if let Some(ref tok) = args.token {
+    let raw_token = args.token.clone().or_else(|| config.token.clone());
+    let token = match raw_token {
+        Some(ref t) if !t.trim().is_empty() && t != "YOUR_TOKEN_HERE" => Some(t.trim().to_string()),
+        _ => None,
+    };
+
+    if let Some(ref tok) = token {
         let mut cfg = config.clone();
         cfg.token = Some(tok.clone());
         cfg.save();
@@ -42,8 +48,6 @@ async fn main() {
         .relay
         .or(config.relay)
         .unwrap_or_else(|| "wss://ws.ezbchat.fun/ws".to_string());
-
-    let token = args.token.or(config.token);
 
     let relay_url = match Url::parse(&relay_str) {
         Ok(url) => url,
